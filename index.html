@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>PD Lab</title>
+  <style>
+    body { background:#111; color:#eee; font-family:sans-serif; margin:0; padding:10px; }
+    canvas { background:#000; border:1px solid #444; display:block; margin:10px auto; }
+    #editor { background:#222; cursor:crosshair; }
+    .label { font-size:13px; color:#ccc; text-align:center; margin-top:15px; }
+  </style>
+</head>
+<body>
+
+  <div class="label"><h1>PD Lab</h1></div>
+  <canvas id="editor" width="600" height="300"></canvas>
+
+
+  <div style="text-align:center; margin-bottom:10px;">
+    <button id="btnAudio">Play</button>
+    <label style="margin-left:10px;">Freq
+      <input id="freq" type="range" min="40" max="1000" value="220" step="1">
+      <span id="freqVal">220 Hz</span>
+    </label>
+    <label style="margin-left:10px;">Gain
+      <input id="gain" type="range" min="0" max="1" value="0.2" step="0.01">
+      <span id="gainVal">0.20</span>
+    </label>
+  </div>
+
+  <div class="label" style="font-size:12px; color:#888; margin-top:8px;">
+   Made by <a href="https://github.com/kurogedelic">@kurogedelic</a>
+  </div>
+
+<script>
+//--------------------------------------------------------------------
+// CANVAS INIT — 安全に取得 (single overlay)
+//--------------------------------------------------------------------
+const editor = document.getElementById("editor");
+if(!editor) alert("canvas not found");
+
+const ctxE = editor.getContext("2d");
+if(!ctxE) alert("context error");
+
+const W = 600;
+const H = 300;          // single area for editor + result overlay
+const CURVE_GAIN = 1.0; // 初期は直線（phi=t）になるように設定
+const GRID_CELLS_BASE = 10;     // もとの「0..1」領域の分割数
+const GRID_MARGIN_CELLS = 2;    // 上下に追加するマス数
+const GRID_CELLS_TOTAL = GRID_CELLS_BASE + GRID_MARGIN_CELLS*2;
+const VMIN = 0 - GRID_MARGIN_CELLS/GRID_CELLS_BASE; // -0.2
+const VMAX = 1 + GRID_MARGIN_CELLS/GRID_CELLS_BASE; //  1.2
+const VSPAN = VMAX - VMIN;                          //  1.4
+// Audio state
+let audioCtx = null;
+let audioNode = null;
+let audioPhase = 0;
+let audioPlaying = false;
+let audioFreq = 220;
+let audioGain = 0.2;
+
+//--------------------------------------------------------------------
+// Bezier control points
+//--------------------------------------------------------------------
+let P0 = { x:0,   y:0   };
+// Two editable points; each can be Bezier handle (orange) or linear midpoint (cyan)
+let CTRL = [
+  { x: 1/3, y: 1/3, mode: 'linear' },
+  { x: 2/3, y: 2/3, mode: 'linear' },
+];
+let P3 = { x:1,   y:1   };
+let dragTarget = null;
+
+//--------------------------------------------------------------------
+// Bezier helper
+//--------------------------------------------------------------------
+function bezier(t, a,b,c,d){
+  const u = 1-t;
+  return u*u*u*a + 3*u*u*t*b + 3*u*t*t*c + t*t*t*d;
+}
+
+// Base mapping v0(t)
+function phiCurve(t){
+  // if any cyan midpoints exist, use polyline through them; otherwise use cubic with both oranges
+  const mids = CTRL.filter(p => p.mode === 'linear').map(p => ({x:p.x, y:p.y}));
+  if (mids.length > 0){
+    const pts = [{x:0, y:P0.y}, ...mids, {x:1, y:P3.y}].sort((a,b)=>a.x-b.x);
+    const tt = Math.min(1, Math.max(0, t));
+    for(let i=0;i<pts.length-1;i++){
+      const a = pts[i], b = pts[i+1];
+      if(tt >= a.x && tt <= b.x){
+        const s = (tt - a.x) / Math.max(1e-6, (b.x - a.x));
+        return a.y + s*(b.y - a.y);
+      }
+    }
+    return pts[pts.length-1].y;
+  }
+  // default: cubic bezier using both controls' y
+  const h1 = CTRL[0], h2 = CTRL[1];
+  return bezier(t, P0.y, h1.y, h2.y, P3.y);
+}
+
+// 位相マップ: 中心0.5からの偏差を増幅（端点固定なし、連続表示）。
+// phi(t) = 0.5 + g*(v0 - 0.5)
+function phaseMap(t){
+  const v0 = phiCurve(t);
+  return 0.5 + CURVE_GAIN * (v0 - 0.5);
+}
+
+//--------------------------------------------------------------------
+// Editor drawing (overlay area)
+//--------------------------------------------------------------------
+function drawEditor(){
+  // clear full canvas background
+  ctxE.fillStyle = "#222";
+  ctxE.fillRect(0,0,W,H);
+
+  // grid (full area)
+  ctxE.strokeStyle = "#333";
+  for(let i=0;i<=10;i++){
+    const x = W*i/10;
+    ctxE.beginPath(); ctxE.moveTo(x,0); ctxE.lineTo(x,H); ctxE.stroke();
+  }
+  for(let j=0;j<=GRID_CELLS_TOTAL;j++){
+    const y = H*j/GRID_CELLS_TOTAL;
+    ctxE.beginPath(); ctxE.moveTo(0,y); ctxE.lineTo(W,y); ctxE.stroke();
+  }
+
+  const mapY = v => H * (1 - (v - VMIN)/VSPAN);
+  const a0x = P0.x*W, a0y = mapY(P0.y);
+  const a3x = P3.x*W, a3y = mapY(P3.y);
+  // Orange handles hidden: no handle lines
+
+  // cyan curve/lines (phi(t))
+  const mids = CTRL.filter(p=>p.mode==='linear');
+  ctxE.strokeStyle = "#0ff";
+  ctxE.beginPath();
+  if (mids.length > 0){
+    const pts = [{x:0,y:P0.y}, ...mids, {x:1,y:P3.y}].sort((a,b)=>a.x-b.x);
+    for(let i=0;i<pts.length;i++){
+      const px = pts[i].x*W;
+      const py = mapY(pts[i].y);
+      if(i===0) ctxE.moveTo(px,py);
+      else      ctxE.lineTo(px,py);
+    }
+  } else {
+    for(let i=0;i<=W;i++){
+      const t = i/W;
+      const v = phaseMap(t);
+      const py = mapY(v);
+      if(i===0) ctxE.moveTo(i,py);
+      else      ctxE.lineTo(i,py);
+    }
+  }
+  ctxE.stroke();
+
+  // anchor points (endpoints in gray)
+  ctxE.fillStyle = "#bbb";
+  ctxE.beginPath(); ctxE.arc(a0x,a0y,4,0,Math.PI*2); ctxE.fill();
+  ctxE.beginPath(); ctxE.arc(a3x,a3y,4,0,Math.PI*2); ctxE.fill();
+
+  // Only cyan points shown
+  CTRL.forEach(p => drawPointCyan(p));
+}
+
+function drawPoint(P){
+  const x = P.x*W;
+  const y = H * (1 - (P.y - VMIN)/VSPAN);
+  ctxE.fillStyle = "#f80";
+  ctxE.beginPath(); ctxE.arc(x,y,6,0,Math.PI*2); ctxE.fill();
+}
+
+function drawPointCyan(P){
+  const x = P.x*W;
+  const y = H * (1 - (P.y - VMIN)/VSPAN);
+  ctxE.fillStyle = "#0ff";
+  ctxE.beginPath(); ctxE.arc(x,y,6,0,Math.PI*2); ctxE.fill();
+}
+
+//--------------------------------------------------------------------
+// Result drawing (overlay area)
+//--------------------------------------------------------------------
+function drawResult(){
+  // draw phase-distorted sine (overlay) — 1位相固定
+  ctxE.strokeStyle = "#0f0";
+  ctxE.lineWidth = 1.2;
+  ctxE.beginPath();
+  for(let i=0;i<W;i++){
+    const t = i/W;
+    const pd = phaseMap(t);
+    const y = Math.sin(2*Math.PI*pd);
+    const py = H*0.5 - y*(H*0.45);
+    if(i===0) ctxE.moveTo(i,py);
+    else      ctxE.lineTo(i,py);
+  }
+  ctxE.stroke();
+}
+
+//--------------------------------------------------------------------
+// Redraw all
+//--------------------------------------------------------------------
+function redraw(){
+  drawEditor();
+  drawResult();
+}
+
+//--------------------------------------------------------------------
+// Editor interactions (full area)
+//--------------------------------------------------------------------
+// Use Pointer Events with capture so drag continues outside canvas
+let activePointerId = null;
+editor.addEventListener("pointerdown", e =>{
+  const r = editor.getBoundingClientRect();
+  const mx = e.clientX - r.left;
+  const my = e.clientY - r.top;
+
+  dragTarget = null;
+  CTRL.forEach(P=>{
+    const dx = mx - P.x*W;
+    const py = H * (1 - (P.y - VMIN)/VSPAN);
+    const dy = my - py;
+    if(dx*dx + dy*dy < 200) dragTarget = P;
+  });
+  if(dragTarget){
+    activePointerId = e.pointerId;
+    try { editor.setPointerCapture(activePointerId); } catch(_){}
+    e.preventDefault();
+  }
+});
+
+editor.addEventListener("pointermove", e =>{
+  if(!dragTarget) return;
+  if(activePointerId !== null && e.pointerId !== activePointerId) return;
+  const r = editor.getBoundingClientRect();
+  const mx = e.clientX - r.left;
+  const my = e.clientY - r.top;
+  // normal sensitivity; allow wider freedom for handles/points
+  const nx = mx / W;
+  // invert Y and map from canvas to value space with margins
+  let ny = VMIN + (1 - my / H) * VSPAN;
+  // x clamp by mode per point
+  if (dragTarget.mode === 'bezier'){
+    dragTarget.x = Math.min(1.5, Math.max(-0.5, nx));
+  } else {
+    // linear midpoints can go to edges [0,1]
+    dragTarget.x = Math.min(1.0, Math.max(0.0, nx));
+  }
+  dragTarget.y = Math.min(2.0, Math.max(-1.0, ny));
+  redraw();
+});
+
+// Double-click toggling disabled: orange handles hidden, cyan only
+
+function endPointerDrag(e){
+  if(activePointerId !== null && e.pointerId !== activePointerId) return;
+  dragTarget = null;
+  try { editor.releasePointerCapture(activePointerId); } catch(_){}
+  activePointerId = null;
+}
+editor.addEventListener("pointerup", endPointerDrag);
+editor.addEventListener("pointercancel", endPointerDrag);
+
+//--------------------------------------------------------------------
+// INIT
+//--------------------------------------------------------------------
+window.onload = () => {
+  editor.width = W;
+  editor.height = H;
+  redraw();
+  // Hook up audio controls
+  const btn = document.getElementById('btnAudio');
+  const freq = document.getElementById('freq');
+  const gain = document.getElementById('gain');
+  const freqVal = document.getElementById('freqVal');
+  const gainVal = document.getElementById('gainVal');
+
+  function ensureContext(){
+    if(!audioCtx){
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+  }
+
+  function startAudio(){
+    ensureContext();
+    if(audioPlaying) return;
+    const bufferSize = 1024;
+    audioNode = audioCtx.createScriptProcessor(bufferSize, 0, 1);
+    audioNode.onaudioprocess = (e)=>{
+      const out = e.outputBuffer.getChannelData(0);
+      const sr = audioCtx.sampleRate;
+      const inc = audioFreq / sr;
+      for(let i=0;i<out.length;i++){
+        audioPhase += inc;
+        if(audioPhase >= 1) audioPhase -= 1;
+        let phi = phaseMap(audioPhase);
+        phi = phi - Math.floor(phi); // wrap
+        out[i] = Math.sin(2*Math.PI*phi) * audioGain;
+      }
+    };
+    audioNode.connect(audioCtx.destination);
+    audioPlaying = true;
+    btn.textContent = 'Stop';
+  }
+
+  function stopAudio(){
+    if(!audioPlaying) return;
+    try{ audioNode.disconnect(); }catch(_){ }
+    audioNode = null;
+    audioPlaying = false;
+    btn.textContent = 'Play';
+  }
+
+  btn.addEventListener('click', ()=>{
+    if(!audioPlaying) startAudio(); else stopAudio();
+  });
+  freq.addEventListener('input', ()=>{
+    audioFreq = Number(freq.value);
+    freqVal.textContent = audioFreq + ' Hz';
+  });
+  gain.addEventListener('input', ()=>{
+    audioGain = Number(gain.value);
+    gainVal.textContent = audioGain.toFixed(2);
+  });
+};
+</script>
+
+</body>
+</html>
