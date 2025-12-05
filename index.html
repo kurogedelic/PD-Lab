@@ -13,6 +13,23 @@
 <body>
 
   <div class="label"><h1>PD Lab</h1></div>
+  <div style="text-align:center; margin:6px 0;">
+    <label style="margin-right:12px;">Curve
+      <select id="curveMode">
+        <option value="linear" selected>Linear</option>
+        <option value="bezier">Bezier</option>
+      </select>
+    </label>
+    <label>Carrier
+      <select id="waveform">
+        <option value="sine" selected>sine</option>
+        <option value="cosine">cosine</option>
+        <option value="sawtooth">sawtooth</option>
+        <option value="triangle">triangle</option>
+        <option value="square">square</option>
+      </select>
+    </label>
+  </div>
   <canvas id="editor" width="600" height="300"></canvas>
 
 
@@ -31,6 +48,8 @@
   <div class="label" style="font-size:12px; color:#888; margin-top:8px;">
    Made by <a href="https://github.com/kurogedelic">@kurogedelic</a>
   </div>
+
+<!-- Bezier: custom minimal cubic implementation (no external deps) -->
 
 <script>
 //--------------------------------------------------------------------
@@ -58,18 +77,77 @@ let audioPhase = 0;
 let audioPlaying = false;
 let audioFreq = 220;
 let audioGain = 0.2;
+let carrierType = 'sine';
 
 //--------------------------------------------------------------------
 // Bezier control points
 //--------------------------------------------------------------------
 let P0 = { x:0,   y:0   };
-// Two editable points; each can be Bezier handle (orange) or linear midpoint (cyan)
+// Editable points: 'linear' (cyan, used as polyline mids) or 'bezier' (orange, used as handles)
 let CTRL = [
-  { x: 1/3, y: 1/3, mode: 'linear' },
-  { x: 2/3, y: 2/3, mode: 'linear' },
+  { x: 1/3, y: 1/3 },
+  { x: 2/3, y: 2/3 },
 ];
 let P3 = { x:1,   y:1   };
 let dragTarget = null;
+
+// Bezier integration state (custom cubic)
+let bezierState = { active:false, ctrl:null, lut:null };
+let curveMode = 'linear'; // 'linear' | 'bezier'
+
+function updateBezierState(){
+  // Build a 2D cubic Bezier from first two control points when in bezier mode
+  if (curveMode !== 'bezier') {
+    bezierState = {active:false, ctrl:null, lut:null};
+    return;
+  }
+  const pts = CTRL.slice().sort((a,b)=>a.x-b.x);
+  if (pts.length < 2){
+    bezierState = {active:false, ctrl:null, lut:null};
+    return;
+  }
+  const h1 = pts[0], h2 = pts[1];
+  const ctrl = {
+    x: [0, h1.x, h2.x, 1],
+    y: [P0.y, h1.y, h2.y, P3.y]
+  };
+  const lut = [];
+  const N = 512;
+  for(let i=0;i<=N;i++){
+    const t = i/N;
+    const x = bezier(t, ctrl.x[0], ctrl.x[1], ctrl.x[2], ctrl.x[3]);
+    const y = bezier(t, ctrl.y[0], ctrl.y[1], ctrl.y[2], ctrl.y[3]);
+    lut.push({x,y,t});
+  }
+  bezierState = {active:true, ctrl, lut};
+}
+
+function bezierYAtX(x){
+  const bs = bezierState;
+  if(!bs.active) return null;
+  const lut = bs.lut;
+  if (x <= lut[0].x) return lut[0].y;
+  if (x >= lut[lut.length-1].x) return lut[lut.length-1].y;
+  let lo = null, hi = null;
+  let nearest = {idx:0, d:Infinity};
+  for(let i=0;i<lut.length-1;i++){
+    const a = lut[i], b = lut[i+1];
+    const d = Math.abs(a.x - x);
+    if(d < nearest.d){ nearest = {idx:i, d}; }
+    if((a.x <= x && x <= b.x) || (a.x >= x && x >= b.x)){
+      lo = a; hi = b; break;
+    }
+  }
+  if(!lo || !hi){
+    const p = lut[nearest.idx];
+    return p.y;
+  }
+  const span = (hi.x - lo.x) || 1e-6;
+  const s = (x - lo.x) / span;
+  const t = lo.t + s * (hi.t - lo.t);
+  const y = bezier(t, bs.ctrl.y[0], bs.ctrl.y[1], bs.ctrl.y[2], bs.ctrl.y[3]);
+  return y;
+}
 
 //--------------------------------------------------------------------
 // Bezier helper
@@ -81,10 +159,14 @@ function bezier(t, a,b,c,d){
 
 // Base mapping v0(t)
 function phiCurve(t){
-  // if any cyan midpoints exist, use polyline through them; otherwise use cubic with both oranges
-  const mids = CTRL.filter(p => p.mode === 'linear').map(p => ({x:p.x, y:p.y}));
-  if (mids.length > 0){
-    const pts = [{x:0, y:P0.y}, ...mids, {x:1, y:P3.y}].sort((a,b)=>a.x-b.x);
+  // Prefer real 2D bezier if available (y at x=t)
+  if (bezierState.active){
+    const y = bezierYAtX(t);
+    if (y !== null) return y;
+  }
+  // Otherwise, use polyline through control midpoints in linear mode
+  if (curveMode === 'linear' && CTRL.length > 0){
+    const pts = [{x:0, y:P0.y}, ...CTRL, {x:1, y:P3.y}].sort((a,b)=>a.x-b.x);
     const tt = Math.min(1, Math.max(0, t));
     for(let i=0;i<pts.length-1;i++){
       const a = pts[i], b = pts[i+1];
@@ -95,9 +177,8 @@ function phiCurve(t){
     }
     return pts[pts.length-1].y;
   }
-  // default: cubic bezier using both controls' y
-  const h1 = CTRL[0], h2 = CTRL[1];
-  return bezier(t, P0.y, h1.y, h2.y, P3.y);
+  // Fallback: straight line
+  return P0.y + t*(P3.y - P0.y);
 }
 
 // 位相マップ: 中心0.5からの偏差を増幅（端点固定なし、連続表示）。
@@ -105,6 +186,30 @@ function phiCurve(t){
 function phaseMap(t){
   const v0 = phiCurve(t);
   return 0.5 + CURVE_GAIN * (v0 - 0.5);
+}
+
+//--------------------------------------------------------------------
+// Carrier waveform helper
+//--------------------------------------------------------------------
+function carrierAt(phase){
+  // phase expected in [0,1)
+  const p = phase - Math.floor(phase);
+  switch (carrierType){
+    case 'cosine':
+      return Math.cos(2*Math.PI*p);
+    case 'sawtooth':
+      // rising saw in [-1,1]
+      return 2*p - 1;
+    case 'triangle':
+      // symmetric triangle in [-1,1]
+      return 1 - 4 * Math.abs(p - 0.5);
+    case 'square':
+      // 50% duty square in [-1,1]
+      return (p < 0.5) ? 1 : -1;
+    case 'sine':
+    default:
+      return Math.sin(2*Math.PI*p);
+  }
 }
 
 //--------------------------------------------------------------------
@@ -129,38 +234,56 @@ function drawEditor(){
   const mapY = v => H * (1 - (v - VMIN)/VSPAN);
   const a0x = P0.x*W, a0y = mapY(P0.y);
   const a3x = P3.x*W, a3y = mapY(P3.y);
-  // Orange handles hidden: no handle lines
+  // Draw control polygon for current mode
+  if (curveMode === 'bezier' && bezierState.active) {
+    const pts = CTRL.slice().sort((a,b)=>a.x-b.x);
+    if (pts.length >= 2) {
+      ctxE.strokeStyle = "#f80";
+      ctxE.lineWidth = 1;
+      const h1 = pts[0], h2 = pts[1];
+      ctxE.beginPath();
+      ctxE.moveTo(a0x, a0y);
+      ctxE.lineTo(h1.x*W, mapY(h1.y));
+      ctxE.lineTo(h2.x*W, mapY(h2.y));
+      ctxE.lineTo(a3x, a3y);
+      ctxE.stroke();
+    }
+  }
 
-  // cyan curve/lines (phi(t))
-  const mids = CTRL.filter(p=>p.mode==='linear');
+  // cyan curve/lines (phi(t)) — always draw active mapping
   ctxE.strokeStyle = "#0ff";
   ctxE.beginPath();
-  if (mids.length > 0){
-    const pts = [{x:0,y:P0.y}, ...mids, {x:1,y:P3.y}].sort((a,b)=>a.x-b.x);
+  for(let i=0;i<=W;i++){
+    const t = i/W;
+    const v = phaseMap(t);
+    const py = mapY(v);
+    if(i===0) ctxE.moveTo(i,py);
+    else      ctxE.lineTo(i,py);
+  }
+  ctxE.stroke();
+
+  // draw linear polyline reference if in linear mode
+  if (curveMode === 'linear'){
+    const pts = [{x:0,y:P0.y}, ...CTRL, {x:1,y:P3.y}].sort((a,b)=>a.x-b.x);
+    ctxE.strokeStyle = "#066";
+    ctxE.beginPath();
     for(let i=0;i<pts.length;i++){
       const px = pts[i].x*W;
       const py = mapY(pts[i].y);
-      if(i===0) ctxE.moveTo(px,py);
-      else      ctxE.lineTo(px,py);
+      if(i===0) ctxE.moveTo(px,py); else ctxE.lineTo(px,py);
     }
-  } else {
-    for(let i=0;i<=W;i++){
-      const t = i/W;
-      const v = phaseMap(t);
-      const py = mapY(v);
-      if(i===0) ctxE.moveTo(i,py);
-      else      ctxE.lineTo(i,py);
-    }
+    ctxE.stroke();
   }
-  ctxE.stroke();
 
   // anchor points (endpoints in gray)
   ctxE.fillStyle = "#bbb";
   ctxE.beginPath(); ctxE.arc(a0x,a0y,4,0,Math.PI*2); ctxE.fill();
   ctxE.beginPath(); ctxE.arc(a3x,a3y,4,0,Math.PI*2); ctxE.fill();
 
-  // Only cyan points shown
-  CTRL.forEach(p => drawPointCyan(p));
+  // Draw control points by global mode
+  CTRL.forEach(p => {
+    if(curveMode === 'linear') drawPointCyan(p); else drawPoint(p);
+  });
 }
 
 function drawPoint(P){
@@ -181,14 +304,14 @@ function drawPointCyan(P){
 // Result drawing (overlay area)
 //--------------------------------------------------------------------
 function drawResult(){
-  // draw phase-distorted sine (overlay) — 1位相固定
+  // draw phase-distorted carrier (overlay) — 1位相固定
   ctxE.strokeStyle = "#0f0";
   ctxE.lineWidth = 1.2;
   ctxE.beginPath();
   for(let i=0;i<W;i++){
     const t = i/W;
     const pd = phaseMap(t);
-    const y = Math.sin(2*Math.PI*pd);
+    const y = carrierAt(pd);
     const py = H*0.5 - y*(H*0.45);
     if(i===0) ctxE.moveTo(i,py);
     else      ctxE.lineTo(i,py);
@@ -200,6 +323,7 @@ function drawResult(){
 // Redraw all
 //--------------------------------------------------------------------
 function redraw(){
+  updateBezierState();
   drawEditor();
   drawResult();
 }
@@ -210,17 +334,24 @@ function redraw(){
 // Use Pointer Events with capture so drag continues outside canvas
 let activePointerId = null;
 editor.addEventListener("pointerdown", e =>{
+  // ignore right-click (no context actions)
+  if (e.button === 2) return;
   const r = editor.getBoundingClientRect();
   const mx = e.clientX - r.left;
   const my = e.clientY - r.top;
 
+  // pick nearest point within threshold for dragging
   dragTarget = null;
+  let best = null; let bestD2 = Infinity;
   CTRL.forEach(P=>{
-    const dx = mx - P.x*W;
+    const px = P.x*W;
     const py = H * (1 - (P.y - VMIN)/VSPAN);
+    const dx = mx - px;
     const dy = my - py;
-    if(dx*dx + dy*dy < 200) dragTarget = P;
+    const d2 = dx*dx + dy*dy;
+    if(d2 < bestD2){ bestD2 = d2; best = P; }
   });
+  if(best && bestD2 < 200) dragTarget = best;
   if(dragTarget){
     activePointerId = e.pointerId;
     try { editor.setPointerCapture(activePointerId); } catch(_){}
@@ -238,18 +369,11 @@ editor.addEventListener("pointermove", e =>{
   const nx = mx / W;
   // invert Y and map from canvas to value space with margins
   let ny = VMIN + (1 - my / H) * VSPAN;
-  // x clamp by mode per point
-  if (dragTarget.mode === 'bezier'){
-    dragTarget.x = Math.min(1.5, Math.max(-0.5, nx));
-  } else {
-    // linear midpoints can go to edges [0,1]
-    dragTarget.x = Math.min(1.0, Math.max(0.0, nx));
-  }
+  // clamp to [0,1] for x; allow full range for both modes
+  dragTarget.x = Math.min(1.0, Math.max(0.0, nx));
   dragTarget.y = Math.min(2.0, Math.max(-1.0, ny));
   redraw();
 });
-
-// Double-click toggling disabled: orange handles hidden, cyan only
 
 function endPointerDrag(e){
   if(activePointerId !== null && e.pointerId !== activePointerId) return;
@@ -271,6 +395,8 @@ window.onload = () => {
   const btn = document.getElementById('btnAudio');
   const freq = document.getElementById('freq');
   const gain = document.getElementById('gain');
+  const waveform = document.getElementById('waveform');
+  const curveSel = document.getElementById('curveMode');
   const freqVal = document.getElementById('freqVal');
   const gainVal = document.getElementById('gainVal');
 
@@ -294,7 +420,7 @@ window.onload = () => {
         if(audioPhase >= 1) audioPhase -= 1;
         let phi = phaseMap(audioPhase);
         phi = phi - Math.floor(phi); // wrap
-        out[i] = Math.sin(2*Math.PI*phi) * audioGain;
+        out[i] = carrierAt(phi) * audioGain;
       }
     };
     audioNode.connect(audioCtx.destination);
@@ -320,6 +446,14 @@ window.onload = () => {
   gain.addEventListener('input', ()=>{
     audioGain = Number(gain.value);
     gainVal.textContent = audioGain.toFixed(2);
+  });
+  waveform.addEventListener('change', ()=>{
+    carrierType = waveform.value;
+    redraw();
+  });
+  curveSel.addEventListener('change', ()=>{
+    curveMode = curveSel.value;
+    redraw();
   });
 };
 </script>
